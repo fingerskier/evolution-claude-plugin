@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
 import { gitRoot, normalizeRemote, projectDir, projectIdentity, skillKey } from '../scripts/lib/paths.mjs';
@@ -60,7 +60,8 @@ test('projectDir: explicit, then CLAUDE_PROJECT_DIR, then the git root above cwd
   const cwd = process.cwd();
   try {
     process.chdir(sub);
-    assert.equal(projectDir(), root, 'a wandering cwd climbs back to the repo');
+    // process.cwd() is canonical: on macOS /var/folders/... reads back as /private/var/...
+    assert.equal(projectDir(), realpathSync(root), 'a wandering cwd climbs back to the repo');
   } finally {
     process.chdir(cwd);
   }
