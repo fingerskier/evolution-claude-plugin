@@ -110,10 +110,13 @@ export function projectIdentity(dir) {
 }
 
 // Stable, filesystem-safe id for a skill's history and archive: user skills
-// by name, project skills by project identity and name.
+// by name, project skills by project identity and name. Every part comes from
+// the identity (the readable prefix is the repo name), so renaming the
+// checkout directory doesn't orphan snapshots.
 export function skillSlug({ scope, name, project }) {
   if (scope === 'user') return `user--${safe(name)}`;
-  return `${safe(basename(project))}-${shortHash(projectIdentity(project))}--${safe(name)}`;
+  const id = projectIdentity(project);
+  return `${safe(id.split('#')[0].split(/[\\/]/).filter(Boolean).at(-1))}-${shortHash(id)}--${safe(name)}`;
 }
 
 // v0.1 hashed the absolute path; still read so old snapshots stay reachable.

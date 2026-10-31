@@ -95,6 +95,9 @@ export function candidates(skills, ledger, {
   troubleUses = 3, troubleRate = 0.5, now = Date.now(),
 } = {}) {
   const out = [];
+  // Locked skills (`metadata: evolution: "off"`) are never nudged about or
+  // edited, so they are never candidates, not even for overlap.
+  skills = skills.filter((s) => !s.locked);
   for (const skill of skills) {
     const s = stats(skill, ledger, now);
     if (s.hitsSince >= troubleUses && s.strugglesSince / s.hitsSince >= troubleRate) {

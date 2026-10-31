@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
 import {
@@ -145,4 +145,19 @@ test('snapshots saved under the v0.1 path-based slug are still found', () => {
   assert.equal(register(resolveSkill('old-one')).version, 2, 'numbering continues from the old snapshots');
   rollback(resolveSkill('old-one'), 1);
   assert.match(readFileSync(join(dir, 'SKILL.md'), 'utf8'), /original/);
+});
+
+test('renaming the checkout directory keeps a project skill\'s history', () => {
+  mkdirSync(join(box.env.CLAUDE_PROJECT_DIR, '.git'), { recursive: true });
+  writeFileSync(join(box.env.CLAUDE_PROJECT_DIR, '.git', 'config'), '[remote "origin"]\n\turl = git@github.com:o/r.git\n');
+  writeSkill(box.projectSkills, 'portable');
+  const before = resolveSkill('portable');
+  register(before);
+  const renamed = join(box.root, 'renamed-checkout');
+  renameSync(box.env.CLAUDE_PROJECT_DIR, renamed);
+  process.env.CLAUDE_PROJECT_DIR = renamed;
+  const after = resolveSkill('portable');
+  assert.equal(after.slug, before.slug);
+  assert.equal(after.key, before.key);
+  assert.deepEqual(history(after).snapshots.map((s) => s.version), [1]);
 });

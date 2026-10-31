@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { afterEach, beforeEach, test } from 'node:test';
 import { ago, candidates, stats, usage } from '../scripts/lib/ledger.mjs';
 import { register, resolveSkill, scanSkills } from '../scripts/lib/skills.mjs';
@@ -72,6 +73,21 @@ test('a skill that keeps being followed by trouble is a refine candidate, until 
   const refined = [...events, { ev: 'register', key: skill.key, t: at(4) + 10 }, { ev: 'hit', key: skill.key, t: at(5) }];
   assert.equal(candidates([skill], usage(refined), { now: at(6) }).length, 0, 'a new version starts clean');
   assert.equal(stats(skill, usage(refined), at(6)).struggles, 3, 'lifetime totals are kept');
+});
+
+test('locked skills are never candidates, even with a stamp, trouble and a stale clock', () => {
+  // Stamped first, locked afterwards: the case where the version metadata stays.
+  const stamped = evolved('frozen');
+  writeFileSync(stamped.file, readFileSync(stamped.file, 'utf8').replace('metadata:\n', 'metadata:\n  evolution: "off"\n'));
+  const skill = scanSkills().find((s) => s.name === 'frozen');
+  const twin = evolved('frozen-twin', { description: skill.description });
+  assert.ok(skill.locked && skill.evolved);
+  const events = [
+    ...sessions(50, T0 + DAY),
+    ...[1, 2, 3].flatMap((d) => [{ ev: 'hit', key: skill.key, t: T0 + d * DAY }, { ev: 'struggle', key: skill.key, t: T0 + d * DAY + 1 }]),
+  ];
+  const found = candidates([skill, twin], usage(events), { now: T0 + 90 * DAY });
+  assert.ok(found.every((c) => !c.skill.includes('frozen +') && c.skill !== 'frozen'), JSON.stringify(found));
 });
 
 test('duplicate session events (resume) count once', () => {
