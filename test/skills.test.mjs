@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
 import {
   archived, history, register, resolveSkill, restore, retire, rollback, scanSkills,
 } from '../scripts/lib/skills.mjs';
+import { mkdirSync } from 'node:fs';
+import { historyDir, legacySlug } from '../scripts/lib/paths.mjs';
 import { readEvents } from '../scripts/lib/store.mjs';
 import { sandbox, writeSkill } from './helpers.mjs';
 
@@ -100,6 +102,10 @@ test('resolveSkill: names, paths, scopes and ambiguity', () => {
   assert.throws(() => resolveSkill('ghost'), /no skill named "ghost"/);
   const stray = writeSkill(join(box.root, 'elsewhere'), 'stray');
   assert.throws(() => resolveSkill(stray), /not directly inside a skills directory/);
+  const other = writeSkill(join(box.root, 'other-repo', '.claude', 'skills'), 'theirs');
+  const found = resolveSkill(other);
+  assert.equal(found.scope, 'project', 'a .claude/skills path names its own project');
+  assert.equal(found.project, join(box.root, 'other-repo'));
 });
 
 test('project and user skills with the same name get distinct histories', () => {
@@ -112,4 +118,46 @@ test('project and user skills with the same name get distinct histories', () => 
   register(p);
   assert.equal(history(resolveSkill('twin', { scope: 'user' })).snapshots.length, 1);
   assert.equal(history(resolveSkill('twin', { scope: 'project' })).snapshots.length, 1);
+});
+
+test('owners: hand-written until registered, evolved after, locked on request', () => {
+  writeSkill(box.userSkills, 'mine');
+  writeSkill(box.userSkills, 'hands-off', { extra: 'metadata:\n  evolution: "off"\n' });
+  assert.equal(resolveSkill('mine').owner, 'hand');
+  register(resolveSkill('mine'));
+  assert.equal(resolveSkill('mine').owner, 'evolved');
+  assert.equal(resolveSkill('hands-off').owner, 'locked');
+  assert.throws(() => register(resolveSkill('hands-off')), /locked/);
+});
+
+test('snapshots saved under the v0.1 path-based slug are still found', () => {
+  mkdirSync(join(box.env.CLAUDE_PROJECT_DIR, '.git'), { recursive: true });
+  writeFileSync(join(box.env.CLAUDE_PROJECT_DIR, '.git', 'config'), '[remote "origin"]\n\turl = git@github.com:o/r.git\n');
+  const dir = writeSkill(box.projectSkills, 'old-one', { body: 'original\n' });
+  const skill = resolveSkill('old-one');
+  assert.notEqual(skill.slug, legacySlug(skill), 'identity-based slug differs from the path-based one');
+  assert.equal(skill.key, 'project:github.com/o/r:old-one');
+  const legacy = historyDir(legacySlug(skill));
+  mkdirSync(legacy, { recursive: true });
+  writeFileSync(join(legacy, 'v1.md'), readFileSync(join(dir, 'SKILL.md'), 'utf8'));
+  assert.deepEqual(history(skill).snapshots.map((s) => s.version), [1]);
+  writeFileSync(join(dir, 'SKILL.md'), readFileSync(join(dir, 'SKILL.md'), 'utf8').replace('original', 'changed'));
+  assert.equal(register(resolveSkill('old-one')).version, 2, 'numbering continues from the old snapshots');
+  rollback(resolveSkill('old-one'), 1);
+  assert.match(readFileSync(join(dir, 'SKILL.md'), 'utf8'), /original/);
+});
+
+test('renaming the checkout directory keeps a project skill\'s history', () => {
+  mkdirSync(join(box.env.CLAUDE_PROJECT_DIR, '.git'), { recursive: true });
+  writeFileSync(join(box.env.CLAUDE_PROJECT_DIR, '.git', 'config'), '[remote "origin"]\n\turl = git@github.com:o/r.git\n');
+  writeSkill(box.projectSkills, 'portable');
+  const before = resolveSkill('portable');
+  register(before);
+  const renamed = join(box.root, 'renamed-checkout');
+  renameSync(box.env.CLAUDE_PROJECT_DIR, renamed);
+  process.env.CLAUDE_PROJECT_DIR = renamed;
+  const after = resolveSkill('portable');
+  assert.equal(after.slug, before.slug);
+  assert.equal(after.key, before.key);
+  assert.deepEqual(history(after).snapshots.map((s) => s.version), [1]);
 });

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { afterEach, beforeEach, test } from 'node:test';
 import { ago, candidates, stats, usage } from '../scripts/lib/ledger.mjs';
 import { register, resolveSkill, scanSkills } from '../scripts/lib/skills.mjs';
@@ -40,14 +41,53 @@ test('hits and keeps reset the idle clock', () => {
   const skill = evolved('useful');
   const policy = { staleDays: 30, staleSessions: 20, now: T0 + 90 * DAY };
   const base = sessions(50, T0 + DAY);
-  const hit = { ev: 'hit', key: skill.dir, t: T0 + 80 * DAY };
+  const hit = { ev: 'hit', key: skill.key, t: T0 + 80 * DAY };
   assert.equal(candidates([skill], usage([...base, hit]), policy).length, 0);
-  const kept = { ev: 'keep', key: skill.dir, t: T0 + 85 * DAY };
+  const kept = { ev: 'keep', key: skill.key, t: T0 + 85 * DAY };
   assert.equal(candidates([skill], usage([...base, kept]), policy).length, 0);
 
   const s = stats(skill, usage([...base, hit, { ...hit, t: hit.t + 1 }]), T0 + 90 * DAY);
   assert.equal(s.hits, 2);
   assert.equal(s.idleDays, 9);
+});
+
+test('v0.1 events keyed by absolute directory still count', () => {
+  const skill = evolved('legacy');
+  const events = [{ ev: 'hit', key: skill.dir, t: T0 + DAY }, { ev: 'hit', key: skill.key, t: T0 + 2 * DAY }];
+  const s = stats(skill, usage(events), T0 + 3 * DAY);
+  assert.equal(s.hits, 2);
+  assert.equal(s.idleDays, 1);
+});
+
+test('a skill that keeps being followed by trouble is a refine candidate, until it is refined', () => {
+  const skill = evolved('shaky');
+  const at = (d) => T0 + d * DAY;
+  const events = [
+    { ev: 'register', key: skill.key, t: T0 },
+    ...[1, 2, 3, 4].map((d) => ({ ev: 'hit', key: skill.key, t: at(d) })),
+    ...[1, 3, 4].map((d) => ({ ev: 'struggle', key: skill.key, t: at(d) + 1 })),
+  ];
+  const [c] = candidates([skill], usage(events), { now: at(5) });
+  assert.equal(c.action, 'refine?');
+  assert.match(c.reason, /3 of its last 4 uses/);
+  const refined = [...events, { ev: 'register', key: skill.key, t: at(4) + 10 }, { ev: 'hit', key: skill.key, t: at(5) }];
+  assert.equal(candidates([skill], usage(refined), { now: at(6) }).length, 0, 'a new version starts clean');
+  assert.equal(stats(skill, usage(refined), at(6)).struggles, 3, 'lifetime totals are kept');
+});
+
+test('locked skills are never candidates, even with a stamp, trouble and a stale clock', () => {
+  // Stamped first, locked afterwards: the case where the version metadata stays.
+  const stamped = evolved('frozen');
+  writeFileSync(stamped.file, readFileSync(stamped.file, 'utf8').replace('metadata:\n', 'metadata:\n  evolution: "off"\n'));
+  const skill = scanSkills().find((s) => s.name === 'frozen');
+  const twin = evolved('frozen-twin', { description: skill.description });
+  assert.ok(skill.locked && skill.evolved);
+  const events = [
+    ...sessions(50, T0 + DAY),
+    ...[1, 2, 3].flatMap((d) => [{ ev: 'hit', key: skill.key, t: T0 + d * DAY }, { ev: 'struggle', key: skill.key, t: T0 + d * DAY + 1 }]),
+  ];
+  const found = candidates([skill, twin], usage(events), { now: T0 + 90 * DAY });
+  assert.ok(found.every((c) => !c.skill.includes('frozen +') && c.skill !== 'frozen'), JSON.stringify(found));
 });
 
 test('duplicate session events (resume) count once', () => {
@@ -62,6 +102,8 @@ test('project skills only count sessions in their own project', () => {
   const skill = scanSkills()[0];
   const elsewhere = usage(sessions(40, T0 + DAY, '/some/other/repo'));
   assert.equal(stats(skill, elsewhere, T0 + 90 * DAY).idleSessions, 0);
+  const sameRepoMoved = usage(sessions(40, T0 + DAY, '/new/path').map((s) => ({ ...s, pid: skill.projectId })));
+  assert.equal(stats(skill, sameRepoMoved, T0 + 90 * DAY).idleSessions, 40, 'matched by identity, not path');
 });
 
 test('long descriptions and overlapping skills are flagged', () => {

@@ -29,7 +29,8 @@ const USAGE = `evolution -- self-evolving skills
   signals [--session ID]                 debug: struggle signals for a session
   hook <event>                           (internal) hook entry point; reads stdin
 
-<skill> is a name or a path. Common flags: --project DIR, --scope user|project.
+<skill> is a name or a path. Common flags: --scope user|project, --project DIR,
+--session ID (find the project the way that Claude Code session saw it).
 State lives in ${evolutionHome()}`;
 
 const BOOLEAN = new Set(['json', 'all', 'force', 'help']);
@@ -73,7 +74,7 @@ const commands = {
     const rows = skills.map((s) => ({ skill: s, ...stats(s, ledger) }));
     if (flags.json) {
       return json(rows.map(({ skill: s, ...st }) => ({
-        name: s.name, scope: s.scope, dir: s.dir, evolved: s.evolved, version: s.version,
+        name: s.name, scope: s.scope, dir: s.dir, owner: s.owner, evolved: s.evolved, version: s.version,
         updated: s.updated, description: s.description, ...st,
       })));
     }
@@ -85,13 +86,15 @@ const commands = {
     }
     const tokens = rows.reduce((n, r) => n + r.descTokens, 0);
     print(`${rows.length} skill${rows.length === 1 ? '' : 's'} · ~${tokens} description tokens in every session\n`);
+    const ver = (s) => (s.locked ? 'locked' : s.evolved ? `v${s.version}` : 'hand');
     print(table(
       rows.map((r) => [
-        r.skill.name, r.skill.scope, r.skill.evolved ? `v${r.skill.version}` : '-', r.hits,
+        r.skill.name, r.skill.scope, ver(r.skill), r.hits, r.hitsSince ? `${r.strugglesSince}/${r.hitsSince}` : '-',
         ago(r.lastHit), `${r.idleDays}d / ${r.idleSessions} sessions`,
       ]),
-      ['NAME', 'SCOPE', 'VER', 'HITS', 'LAST USED', 'IDLE'],
+      ['NAME', 'SCOPE', 'VER', 'HITS', 'TROUBLE', 'LAST USED', 'IDLE'],
     ));
+    print('\nTROUBLE: uses of the current version that were followed by failures or corrections.');
   },
 
   candidates({ flags }) {
@@ -160,7 +163,7 @@ const commands = {
   },
 
   signals({ flags }) {
-    let id = flags.session;
+    let id = typeof flags.session === 'string' && !flags.session.includes('${') ? flags.session : '';
     if (!id) {
       const dir = sessionsDir();
       const files = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith('.jsonl')) : [];
@@ -191,12 +194,22 @@ const commands = {
   },
 };
 
+// The project a Claude Code session started in, as its SessionStart hook
+// recorded it. Skills pass --session "${CLAUDE_SESSION_ID}" because the Bash
+// tool has no CLAUDE_PROJECT_DIR and its cwd wanders.
+function sessionProject(id) {
+  if (!id || typeof id !== 'string' || id.includes('${')) return null;
+  const hit = readEvents().filter((e) => e.ev === 'session' && e.session === id && e.project).at(-1);
+  return hit && existsSync(hit.project) ? hit.project : null;
+}
+
 const { pos, flags } = parseArgs(process.argv.slice(2));
 const cmd = pos.shift();
 if (!cmd || flags.help || !commands[cmd]) {
   print(USAGE);
   process.exit(cmd && !commands[cmd] && !flags.help ? 1 : 0);
 }
+if (!flags.project && !process.env.CLAUDE_PROJECT_DIR && cmd !== 'hook') flags.project = sessionProject(flags.session) ?? undefined;
 if (flags.project) flags.project = projectDir(flags.project);
 try {
   commands[cmd]({ pos, flags });

@@ -24,14 +24,28 @@ function stages(cmd) {
 
 const isProbeStage = (s) => PROBES.has(s.split(/\s+/)[0]) || GIT_PROBE.test(s);
 
+// CLIs whose first argument is the real verb, and verbs that take one more:
+// `npm run build`, `python -m pytest`, `docker compose up`, `gh pr create`.
+const MULTI = /^(npm|pnpm|yarn|bun|npx|bunx|cargo|go|git|docker|podman|kubectl|helm|make|uv|poetry|pip3?|python3?|node|deno|dotnet|mvn|gradle|bundle|rails|mix|gh|glab|aws|gcloud|az|terraform|tofu|fly|flyctl|vercel|netlify|wrangler|supabase|firebase|heroku|systemctl|brew|nx|turbo)$/;
+const DEEP_VERB = new Set(['run', 'exec', '-m', 'compose', 'dlx', 'x']);
+const DEEP_CLI = /^(gh|glab|aws|gcloud|az)$/;
+
 export function commandHead(cmd) {
   const first = stages(cmd)[0]?.[0] ?? String(cmd ?? '').trim();
   const words = first.split(/\s+/);
-  // Keep the subcommand for multiplexers: "npm test", "cargo build", "git push".
-  const n = /^(npm|pnpm|yarn|bun|npx|cargo|go|git|docker|kubectl|make|uv|poetry|pip|python3?|node|deno|dotnet|mvn|gradle|bundle|rails|mix)$/.test(words[0]) ? 2 : 1;
+  let n = MULTI.test(words[0]) ? 2 : 1;
+  if (n === 2 && words[2] && !words[2].startsWith('-') && (DEEP_VERB.has(words[1]) || DEEP_CLI.test(words[0]))) n = 3;
   // `node "/long/path/build.mjs"` reads better as `node build.mjs`.
   return words.slice(0, n).map((w) => w.replace(/^["']|["']$/g, '').split(/[\\/]/).at(-1)).join(' ').slice(0, 60);
 }
+
+// MCP tools as procedure steps: `mcp__slack__send_message` -> `mcp:slack/send_message`.
+// Reads are looking-around, like shell probes.
+export function mcpHead(tool) {
+  const m = /^mcp__(.+?)__(.+)$/.exec(String(tool ?? ''));
+  return m ? `mcp:${m[1]}/${m[2]}` : null;
+}
+export const isMcpRead = (tool) => /_(?:get|list|search|read|query|fetch|find|describe|view|lookup|count|check|poll)(?:_|$)/i.test(String(tool ?? ''));
 
 // Pure looking-around: its success proves nothing and its failure costs nothing.
 export function isProbe(cmd) {
@@ -64,16 +78,30 @@ export function exitCodeOf(text) {
   return m ? Number(m[1]) : null;
 }
 
-// Phrases people type when the previous attempt didn't work.
+// Phrases people type when the previous attempt didn't work -- or wasn't how
+// they wanted it done. Both are lessons; the second kind is how a workflow
+// skill learns the user's way of doing things.
 const CORRECTION = new RegExp(
   [
+    // it's broken
     "\\bstill (?:fail\\w*|broken|wrong|erroring|not (?:working|fixed|passing)|doesn'?t work|getting|seeing|the same)",
-    '\\bsame (?:error|problem|issue|failure|exception|result)\\b',
+    '\\bsame (?:error|problem|issue|failure|exception|result|thing)\\b',
     "\\b(?:that|it|this) (?:didn'?t|doesn'?t|did not|does not|won'?t) (?:work|fix|help|compile|build|pass)",
     '\\bnot (?:fixed|working)\\b',
     '\\b(?:wrong|broken|failing) again\\b',
-    "\\bthat'?s (?:wrong|not it|not right|incorrect)\\b",
+    "\\bthat'?s (?:wrong|not it|not right|incorrect|not what)\\b",
     '\\byou broke\\b',
+    '\\btry again\\b',
+    // do it my way
+    '^\\s*(?:no|nope|nah)\\s*[,.!;:\u2014\u2013-]\\s*(?!(?:thanks|thank you|problem|worries|rush)\\b)',
+    "^\\s*(?:no|nope)\\s+(?:that|this|it|you|we|use|don'?t|not|wait|stop|instead)\\b",
+    '^\\s*nope\\b',
+    "^\\s*actually\\b[,\\s]+(?:we|you|it'?s?|that'?s?|this|use|don'?t|do not|should|need|the|never|always)\\b",
+    "\\b(?:don'?t|do not|never|stop) (?:do|doing|use|using|run|running|call|touch|add|create|edit|change|commit|push|delete|remove) (?:that|this|it|those|these)\\b",
+    '\\bwe (?:always|never|usually|normally) (?:use|run|do|deploy|push|go|have|need)\\b',
+    '\\b(?:use|try|run|call) \\S+(?: \\S+)? instead\\b',
+    '\\binstead of (?:that|this|using|running)\\b',
+    '\\byou (?:forgot|missed|skipped|need(?:ed)? to|have to|should(?: have)?|were supposed to)\\b',
   ].join('|'),
   'i',
 );
@@ -90,27 +118,61 @@ export function slashSkill(prompt) {
   return m ? m[1] : null;
 }
 
-// Look at the session since the last nudge/capture and decide whether it was
-// a struggle that ended in a working state.
+const lastIndex = (events, pred) => events.reduce((acc, e, i) => (pred(e) ? i : acc), -1);
+
+// Score a stretch of session signals. "Resolved" means the thing that was
+// failing now passes: a later success of a command that failed (or, when only
+// corrections were involved, any later success). `git stash` after four red
+// `npm test` runs is not a fix.
+export function judge(events) {
+  const fails = events.filter((e) => e.ev === 'fail');
+  const corrections = events.filter((e) => e.ev === 'correction');
+  const failed = new Set(fails.map((e) => e.cmd).filter(Boolean));
+  const lastBad = lastIndex(events, (e) => e.ev === 'fail' || e.ev === 'correction');
+  const fixedAt = lastIndex(events, (e) => e.ev === 'ok' && (!failed.size || failed.has(e.cmd)));
+  return {
+    score: fails.length + 2 * corrections.length,
+    fails: fails.length,
+    corrections: corrections.length,
+    resolved: fixedAt >= 0 && fixedAt > lastBad,
+    commands: [...failed].slice(0, 3),
+  };
+}
+
+// The trouble that bought a refinement: two failed commands or one correction.
+export const REFINE_SCORE = 2;
+const ACTIVITY = new Set(['ok', 'fail', 'hit']);
+
+// Look at the session since the last nudge/capture and decide what, if
+// anything, to ask about:
+//   refine   a skill fired, then the session struggled, then it was fixed:
+//            that skill was wrong or incomplete, and we know which one.
+//   capture  a struggle (score >= threshold) that ended in a fix.
 export function assessSession(events, threshold) {
   let from = 0;
   events.forEach((e, i) => { if (e.ev === 'nudged' || e.ev === 'captured') from = i + 1; });
-  const arc = events.slice(from);
-  const fails = arc.filter((e) => e.ev === 'fail');
-  const corrections = arc.filter((e) => e.ev === 'correction');
-  const lastIndex = (pred) => arc.reduce((acc, e, i) => (pred(e) ? i : acc), -1);
-  const lastOk = lastIndex((e) => e.ev === 'ok');
-  const lastBad = lastIndex((e) => e.ev === 'fail' || e.ev === 'correction');
-  const score = fails.length + 2 * corrections.length;
-  const resolved = lastOk >= 0 && lastOk > lastBad;
-  return {
-    score,
-    fails: fails.length,
-    corrections: corrections.length,
-    resolved,
-    hard: score >= threshold && resolved,
-    commands: [...new Set(fails.map((e) => e.cmd).filter(Boolean))].slice(0, 3),
-  };
+  // A correction means something only once there is work to correct; the
+  // opening request ("don't use regex") is a spec, not a struggle.
+  const firstActivity = events.findIndex((e) => ACTIVITY.has(e.ev));
+  const arc = events.slice(from).filter((e, i) => e.ev !== 'correction' || (firstActivity >= 0 && from + i > firstActivity));
+  const overall = judge(arc);
+  const hard = overall.score >= threshold && overall.resolved;
+  const refine = findRefine(arc);
+  return { ...overall, hard, refine, kind: refine ? 'refine' : hard ? 'capture' : null };
+}
+
+// The latest skill hit followed (before the next hit) by real trouble, if the
+// session has since recovered. Still broken: nothing to learn yet.
+function findRefine(arc) {
+  const hits = arc.flatMap((e, i) => (e.ev === 'hit' && e.owner !== 'locked' ? [i] : []));
+  for (let h = hits.length - 1; h >= 0; h--) {
+    const at = hits[h];
+    const segment = judge(arc.slice(at + 1, hits[h + 1] ?? arc.length));
+    if (segment.score < REFINE_SCORE) continue;
+    if (!judge(arc.slice(at + 1)).resolved) return null;
+    return { name: arc[at].name, ...segment };
+  }
+  return null;
 }
 
 export function describeArc(a) {

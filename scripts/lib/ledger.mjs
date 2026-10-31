@@ -1,5 +1,6 @@
-// Usage accounting: which evolved skills actually fire, and which have gone
-// idle long enough (in both days *and* sessions) to be worth questioning.
+// Usage accounting: which skills actually fire, how often the session went
+// wrong right after they did, and which have gone idle long enough (in both
+// days *and* sessions) to be worth questioning.
 import { createdAt } from './skills.mjs';
 
 const DAY = 86_400_000;
@@ -8,12 +9,14 @@ const STOP = new Set(
     + 'with without your you skill skills claude code fix fixes run runs').split(' '),
 );
 
+const blank = () => ({ hits: [], struggles: [], lastKeep: null, firstRegister: null, lastRegister: null });
+
 export function usage(events) {
   const bySkill = new Map();
   const sessions = [];
   const seen = new Set();
   const touch = (key) => {
-    if (!bySkill.has(key)) bySkill.set(key, { hits: 0, lastHit: null, lastKeep: null, firstRegister: null });
+    if (!bySkill.has(key)) bySkill.set(key, blank());
     return bySkill.get(key);
   };
   for (const e of events) {
@@ -21,35 +24,57 @@ export function usage(events) {
       if (seen.has(e.session)) continue;
       seen.add(e.session);
       sessions.push(e);
-    } else if (e.ev === 'hit' && e.key) {
-      const u = touch(e.key);
-      u.hits += 1;
-      u.lastHit = Math.max(u.lastHit ?? 0, e.t);
-    } else if (e.ev === 'keep' && e.key) {
+      continue;
+    }
+    if (!e.key) continue;
+    if (e.ev === 'hit') touch(e.key).hits.push(e.t);
+    else if (e.ev === 'struggle') touch(e.key).struggles.push(e.t);
+    else if (e.ev === 'keep') {
       const u = touch(e.key);
       u.lastKeep = Math.max(u.lastKeep ?? 0, e.t);
-    } else if (e.ev === 'register' && e.key) {
+    } else if (e.ev === 'register') {
       const u = touch(e.key);
       u.firstRegister ??= e.t;
+      u.lastRegister = Math.max(u.lastRegister ?? 0, e.t);
     }
   }
   return { bySkill, sessions };
 }
 
-function sessionsSince(sessions, t, project) {
-  return sessions.filter((s) => s.t > t && (!project || s.project === project)).length;
+// v0.1 keyed events by absolute directory; v0.2 by scope + project identity
+// + name. Read both so upgrading loses no history.
+function record(skill, ledger) {
+  const parts = [skill.key, skill.dir].filter(Boolean).map((k) => ledger.bySkill.get(k)).filter(Boolean);
+  if (parts.length < 2) return parts[0] ?? blank();
+  const max = (f) => parts.reduce((m, u) => (u[f] == null ? m : Math.max(m ?? 0, u[f])), null);
+  const min = (f) => parts.reduce((m, u) => (u[f] == null ? m : Math.min(m ?? Infinity, u[f])), null);
+  return {
+    hits: parts.flatMap((u) => u.hits),
+    struggles: parts.flatMap((u) => u.struggles),
+    lastKeep: max('lastKeep'),
+    firstRegister: min('firstRegister'),
+    lastRegister: max('lastRegister'),
+  };
 }
 
+const sameProject = (s, skill) => s.pid === skill.projectId || s.project === skill.project;
+
 export function stats(skill, ledger, now = Date.now()) {
-  const u = ledger.bySkill.get(skill.dir) ?? { hits: 0, lastHit: null, lastKeep: null, firstRegister: null };
+  const u = record(skill, ledger);
+  const lastHit = u.hits.length ? Math.max(...u.hits) : null;
   const born = Math.min(u.firstRegister ?? Infinity, createdAt(skill));
-  const idleFrom = Math.max(u.lastHit ?? 0, u.lastKeep ?? 0, born);
+  const idleFrom = Math.max(lastHit ?? 0, u.lastKeep ?? 0, born);
+  // Outcomes are judged per version: a refinement wipes the slate.
+  const since = u.lastRegister ?? 0;
   return {
-    hits: u.hits,
-    lastHit: u.lastHit,
+    hits: u.hits.length,
+    lastHit,
     born,
+    struggles: u.struggles.length,
+    hitsSince: u.hits.filter((t) => t >= since).length,
+    strugglesSince: u.struggles.filter((t) => t >= since).length,
     idleDays: Math.floor((now - idleFrom) / DAY),
-    idleSessions: sessionsSince(ledger.sessions, idleFrom, skill.scope === 'project' ? skill.project : null),
+    idleSessions: ledger.sessions.filter((s) => s.t > idleFrom && (skill.scope !== 'project' || sameProject(s, skill))).length,
     descTokens: Math.ceil(skill.description.length / 4),
   };
 }
@@ -65,10 +90,22 @@ function jaccard(a, b) {
   return inter / (a.size + b.size - inter);
 }
 
-export function candidates(skills, ledger, { staleDays = 30, staleSessions = 20, maxDescription = 300, maxBodyLines = 500, overlap = 0.45, now = Date.now() } = {}) {
+export function candidates(skills, ledger, {
+  staleDays = 30, staleSessions = 20, maxDescription = 300, maxBodyLines = 500, overlap = 0.45,
+  troubleUses = 3, troubleRate = 0.5, now = Date.now(),
+} = {}) {
   const out = [];
+  // Locked skills (`metadata: evolution: "off"`) are never nudged about or
+  // edited, so they are never candidates, not even for overlap.
+  skills = skills.filter((s) => !s.locked);
   for (const skill of skills) {
     const s = stats(skill, ledger, now);
+    if (s.hitsSince >= troubleUses && s.strugglesSince / s.hitsSince >= troubleRate) {
+      out.push({
+        action: 'refine?', skill: skill.name, scope: skill.scope, dir: skill.dir,
+        reason: `the session struggled right after ${s.strugglesSince} of its last ${s.hitsSince} uses; its content is wrong or incomplete`,
+      });
+    }
     if (s.idleDays >= staleDays && s.idleSessions >= staleSessions) {
       out.push({
         action: 'retire?', skill: skill.name, scope: skill.scope, dir: skill.dir,

@@ -4,13 +4,14 @@
 import { existsSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { candidates, usage } from './ledger.mjs';
-import { projectDir, sessionsDir } from './paths.mjs';
+import { projectDir, projectIdentity, sessionsDir } from './paths.mjs';
 import {
-  assessSession, commandHead, decidingPart, describeArc, exitCodeOf, isCorrection, isOwnCommand, isProbe, isProbeFailure,
-  slashSkill,
+  assessSession, commandHead, decidingPart, describeArc, exitCodeOf, isCorrection, isMcpRead, isOwnCommand, isProbe,
+  isProbeFailure, mcpHead, slashSkill,
 } from './signals.mjs';
-import { findSkillDir, scanSkills } from './skills.mjs';
+import { findSkill, scanSkills } from './skills.mjs';
 import { logEvent, logSession, readEvents, readSession, readState, updateState } from './store.mjs';
+import { MIN_STEPS, findWorkflow, procedureOf } from './workflows.mjs';
 
 const DAY = 86_400_000;
 const NUDGES = ['auto', 'suggest', 'off'];
@@ -50,17 +51,19 @@ function recordHit(name, input, via) {
     if (sid) logSession(sid, { ev: 'captured' });
     return;
   }
-  if (name.includes(':')) return; // other plugins' skills aren't ours to track
-  const found = findSkillDir(name, project(input));
-  if (!found) return;
-  logEvent({ ev: 'hit', key: found.dir, name, scope: found.scope, via, session: sid ?? null });
-  if (sid) logSession(sid, { ev: 'hit', name });
+  if (name.includes(':')) return; // other plugins' skills live in their cache: not ours to track or edit
+  const skill = findSkill(name, project(input));
+  if (!skill) return;
+  logEvent({ ev: 'hit', key: skill.key, dir: skill.dir, name, scope: skill.scope, owner: skill.owner, via, session: sid ?? null });
+  if (sid) logSession(sid, { ev: 'hit', name, owner: skill.owner });
 }
 
 export function sessionStart(input, { now = Date.now() } = {}) {
   const cfg = configFromEnv();
   const proj = project(input);
-  if (input.source !== 'compact') logEvent({ ev: 'session', session: input.session_id ?? null, project: proj });
+  if (input.source !== 'compact') {
+    logEvent({ ev: 'session', session: input.session_id ?? null, project: proj, pid: projectIdentity(proj) });
+  }
   sweepSessions(now);
   const state = readState();
   updateState({ config: cfg });
@@ -70,13 +73,16 @@ export function sessionStart(input, { now = Date.now() } = {}) {
   if (now - (state.lastNotice ?? 0) < 7 * DAY) return null;
   const skills = scanSkills(proj);
   if (!skills.length) return null;
-  const stale = candidates(skills, usage(readEvents()), { ...cfg, now }).filter((c) => c.action === 'retire?');
-  if (!stale.length) return null;
+  const flagged = candidates(skills, usage(readEvents()), { ...cfg, now }).filter((c) => c.action === 'retire?' || c.action === 'refine?');
+  if (!flagged.length) return null;
   updateState({ lastNotice: now });
-  const names = stale.slice(0, 4).map((c) => c.skill).join(', ') + (stale.length > 4 ? ', ...' : '');
-  const n = stale.length;
+  const names = [...new Set(flagged.map((c) => c.skill))];
+  const list = names.slice(0, 4).join(', ') + (names.length > 4 ? ', ...' : '');
+  const n = names.length;
+  const kinds = new Set(flagged.map((c) => c.action));
+  const how = kinds.size > 1 ? 'stale or troubled' : kinds.has('retire?') ? 'stale' : 'troubled';
   return {
-    systemMessage: `evolution: ${n} evolved skill${n === 1 ? ' looks' : 's look'} stale (${names}). Run /evolution:prune to review.`,
+    systemMessage: `evolution: ${n} evolved skill${n === 1 ? ' looks' : 's look'} ${how} (${list}). Run /evolution:prune to review.`,
   };
 }
 
@@ -88,11 +94,15 @@ export function prompt(input) {
 }
 
 export function toolOk(input) {
-  if (input.tool_name === 'Skill') {
+  const sid = input.session_id;
+  const tool = String(input.tool_name ?? '');
+  if (tool === 'Skill') {
     recordHit(String(input.tool_input?.skill ?? '').replace(/^\//, ''), input, 'model');
-  } else if (input.tool_name === 'Bash' && input.session_id) {
+  } else if (tool === 'Bash' && sid) {
     const cmd = input.tool_input?.command;
-    if (!isOwnCommand(cmd) && !isProbe(decidingPart(cmd))) logSession(input.session_id, { ev: 'ok', cmd: commandHead(cmd) });
+    if (!isOwnCommand(cmd) && !isProbe(decidingPart(cmd))) logSession(sid, { ev: 'ok', cmd: commandHead(cmd) });
+  } else if (sid && mcpHead(tool) && !isMcpRead(tool)) {
+    logSession(sid, { ev: 'ok', cmd: mcpHead(tool) });
   }
   return null;
 }
@@ -108,22 +118,87 @@ export function toolFail(input) {
   return null;
 }
 
-export function stop(input) {
+const sinceLast = (events, ev) => events.slice(events.map((e) => e.ev).lastIndexOf(ev) + 1);
+
+// `block` makes Claude act on `reason` before it stops; otherwise the user
+// gets a one-line hint.
+const nudge = (block, reason, hint) => (block ? { decision: 'block', reason } : { systemMessage: hint });
+
+function refineNudge(skill, arc, block) {
+  const what = `${describeArc(arc.refine)} came after it`;
+  const owned = skill.owner === 'evolved'
+    ? `refine ${skill.name} with what was different this time`
+    : `propose a fix to ${skill.name}. It is hand-written, so show the user the change and ask before editing; `
+      + 'if they agree, adopt it with register first so the original is kept as v1';
+  return nudge(
+    block,
+    `[evolution] The skill "${skill.name}" was used this session, and ${what} before things worked. `
+      + `Before stopping, use the evolution:capture skill to ${owned}. `
+      + 'If the trouble had nothing to do with the skill, say so in one line and stop.',
+    `evolution: "${skill.name}" was used, then ${what}. Run /evolution:capture refine ${skill.name} to improve it.`,
+  );
+}
+
+export function stop(input, { now = Date.now() } = {}) {
   const cfg = configFromEnv();
-  if (cfg.nudge === 'off' || input.stop_hook_active || !input.session_id) return null;
-  const arc = assessSession(readSession(input.session_id), cfg.threshold);
-  if (!arc.hard) return null;
-  logSession(input.session_id, { ev: 'nudged', mode: cfg.nudge, score: arc.score });
-  const what = describeArc(arc);
-  if (cfg.nudge === 'suggest') {
-    return { systemMessage: `evolution: that looked like a hard-won fix (${what}). Run /evolution:capture to keep the lesson as a skill.` };
+  const sid = input.session_id;
+  if (!sid) return null;
+  const events = readSession(sid);
+  const turn = sinceLast(events, 'turn-end');
+  logSession(sid, { ev: 'turn-end' });
+
+  // Remember what this turn did, whatever the nudge mode: repetition across
+  // sessions is how workflows are found.
+  const proj = project(input);
+  const steps = procedureOf(turn);
+  if (steps.length >= MIN_STEPS) logEvent({ ev: 'procedure', session: sid, project: projectIdentity(proj), heads: steps });
+  if (input.stop_hook_active) return null;
+
+  const arc = assessSession(events, cfg.threshold);
+
+  // 1. A skill fired and the session struggled: refine *that* skill. The
+  //    outcome is recorded even when nudges are off, so prune can see it.
+  //    This is the most precise signal there is, so in auto mode it always blocks.
+  const skill = arc.refine && findSkill(arc.refine.name, proj);
+  if (skill && skill.owner !== 'locked') {
+    logEvent({ ev: 'struggle', key: skill.key, dir: skill.dir, name: skill.name, scope: skill.scope, session: sid, score: arc.refine.score });
+    logSession(sid, { ev: 'nudged', kind: 'refine', mode: cfg.nudge, skill: skill.name });
+    return cfg.nudge === 'off' ? null : refineNudge(skill, arc, cfg.nudge === 'auto');
   }
-  return {
-    decision: 'block',
-    reason: `[evolution] This looked like a hard-won fix: ${what} before a command succeeded. `
-      + 'Before stopping, use the evolution:capture skill to judge whether the lesson deserves a new or updated skill. '
-      + 'If the work is not actually finished, or the lesson does not clear the bar, say so in one line and stop.',
-  };
+  if (cfg.nudge === 'off') return null;
+
+  // 2 and 3 are guesses; in auto mode only the first one per session blocks.
+  const block = cfg.nudge === 'auto' && !events.some((e) => e.ev === 'blocked');
+  const sent = () => { if (block) logSession(sid, { ev: 'blocked' }); };
+
+  // 2. A struggle that ended in a fix: maybe a new lesson.
+  if (arc.hard) {
+    logSession(sid, { ev: 'nudged', kind: 'capture', mode: cfg.nudge, score: arc.score });
+    sent();
+    const what = describeArc(arc);
+    return nudge(
+      block,
+      `[evolution] This looked like a hard-won fix: ${what} before things worked. `
+        + 'Before stopping, use the evolution:capture skill to judge whether the lesson deserves a new or updated skill. '
+        + 'If the work is not actually finished, or the lesson does not clear the bar, say so in one line and stop.',
+      `evolution: that looked like a hard-won fix (${what}). Run /evolution:capture to keep the lesson as a skill.`,
+    );
+  }
+
+  // 3. A procedure repeated across sessions that no skill covered: maybe a workflow.
+  if (steps.length < MIN_STEPS || turn.some((e) => e.ev === 'hit')) return null;
+  const wf = findWorkflow(steps, readEvents(), { session: sid, now });
+  if (!wf) return null;
+  logEvent({ ev: 'workflow', session: sid, project: projectIdentity(proj), steps: wf.steps });
+  sent();
+  const list = wf.steps.map((s) => `\`${s}\``).join(', ');
+  return nudge(
+    block,
+    `[evolution] This turn repeated a procedure now done in ${wf.sessions} sessions: ${list}. `
+      + 'Before stopping, use the evolution:capture skill to judge whether it should become a workflow skill. '
+      + 'If it is not a stable, repeatable procedure, say so in one line and stop.',
+    `evolution: you have now done ${list} in ${wf.sessions} sessions. Run /evolution:capture workflow to make it a skill.`,
+  );
 }
 
 export const handlers = {

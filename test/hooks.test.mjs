@@ -2,7 +2,7 @@
 // JSON (or nothing) on stdout, always exit 0.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -25,8 +25,14 @@ function hook(event, input, env = {}) {
   return res.stdout.trim() ? JSON.parse(res.stdout) : null;
 }
 
-const fail = (command) => hook('tool-fail', { session_id: 's', tool_name: 'Bash', tool_input: { command }, error: 'Exit code 1\nboom' });
-const ok = (command) => hook('tool-ok', { session_id: 's', tool_name: 'Bash', tool_input: { command } });
+const fail = (command, session_id = 's') => hook('tool-fail', { session_id, tool_name: 'Bash', tool_input: { command }, error: 'Exit code 1\nboom' });
+const ok = (command, session_id = 's') => hook('tool-ok', { session_id, tool_name: 'Bash', tool_input: { command } });
+const useSkill = (skill, session_id = 's') => hook('tool-ok', { session_id, tool_name: 'Skill', tool_input: { skill } });
+const say = (prompt, session_id = 's') => hook('prompt', { session_id, prompt });
+const ledger = () => {
+  const file = join(box.home, 'events.jsonl');
+  return existsSync(file) ? readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse) : [];
+};
 
 function struggle() {
   fail('npm test');
@@ -79,8 +85,7 @@ test('skill hits are counted from the Skill tool and from slash commands', () =>
   hook('prompt', { session_id: 's', prompt: '/mine please' });
   hook('tool-ok', { session_id: 's', tool_name: 'Skill', tool_input: { skill: 'other-plugin:thing' } });
   hook('prompt', { session_id: 's', prompt: '/clear' });
-  const events = readFileSync(join(box.home, 'events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
-  assert.deepEqual(events.map((e) => [e.ev, e.name, e.via]), [['hit', 'mine', 'model'], ['hit', 'mine', 'slash']]);
+  assert.deepEqual(ledger().map((e) => [e.ev, e.name, e.via, e.key]), [['hit', 'mine', 'model', 'user:mine'], ['hit', 'mine', 'slash', 'user:mine']]);
 });
 
 test('session-start counts sessions, saves config, and reminds about stale skills at most weekly', () => {
@@ -117,4 +122,107 @@ test('CLI round trip: list, candidates, retire, restore', () => {
   const bad = run('register', 'ghost');
   assert.equal(bad.status, 1);
   assert.match(bad.stderr, /no skill named "ghost"/);
+});
+
+function deployStruggle(skill = 'deploy-staging') {
+  useSkill(skill);
+  fail('./deploy.sh staging');
+  say('no, you have to pass --canary first');
+  ok('./deploy.sh staging --canary');
+}
+
+test('refine: a skill that fired before a struggle is named, and the outcome is recorded', () => {
+  register(resolveSkill(writeSkill(box.userSkills, 'deploy-staging')));
+  deployStruggle();
+  const out = hook('stop', { session_id: 's' });
+  assert.equal(out.decision, 'block');
+  assert.match(out.reason, /"deploy-staging" was used this session, and 1 failed command \(`deploy.sh`\) and 1 correction/);
+  assert.match(out.reason, /refine deploy-staging/);
+  assert.equal(hook('stop', { session_id: 's' }), null, 'once per arc');
+  const struggles = ledger().filter((e) => e.ev === 'struggle');
+  assert.deepEqual(struggles.map((e) => [e.name, e.key, e.score]), [['deploy-staging', 'user:deploy-staging', 3]]);
+  const list = JSON.parse(spawnSync(process.execPath, [CLI, 'list', '--json'], { encoding: 'utf8', env: process.env }).stdout);
+  assert.equal(list[0].strugglesSince, 1);
+});
+
+test('refine: hand-written skills need the user to agree, and adoption comes first', () => {
+  writeSkill(box.projectSkills, 'deploy-staging');
+  deployStruggle();
+  const out = hook('stop', { session_id: 's' });
+  assert.match(out.reason, /hand-written, so show the user the change and ask before editing/);
+  assert.match(out.reason, /adopt it with register first so the original is kept as v1/);
+});
+
+test('refine: suggest hints, off stays silent but still records, locked skills are left alone', () => {
+  register(resolveSkill(writeSkill(box.userSkills, 'deploy-staging')));
+  deployStruggle();
+  const hint = hook('stop', { session_id: 's' }, { CLAUDE_PLUGIN_OPTION_NUDGE: 'suggest' });
+  assert.match(hint.systemMessage, /\/evolution:capture refine deploy-staging/);
+
+  deployStruggle();
+  assert.equal(hook('stop', { session_id: 's' }, { CLAUDE_PLUGIN_OPTION_NUDGE: 'off' }), null);
+  assert.equal(ledger().filter((e) => e.ev === 'struggle').length, 2, 'off mode still feeds prune');
+
+  writeSkill(box.userSkills, 'frozen', { extra: 'metadata:\n  evolution: "off"\n' });
+  deployStruggle('frozen');
+  assert.equal(hook('stop', { session_id: 's' }), null);
+});
+
+test('nudges: the failing command must pass, and only one guess per session blocks', () => {
+  for (let i = 0; i < 4; i++) fail('npm test');
+  ok('git stash');
+  assert.equal(hook('stop', { session_id: 's' }), null, 'stashing is not a fix');
+  ok('npm test');
+  assert.equal(hook('stop', { session_id: 's' }).decision, 'block');
+  for (let i = 0; i < 4; i++) fail('cargo build');
+  ok('cargo build');
+  const second = hook('stop', { session_id: 's' });
+  assert.equal(second.decision, undefined, 'second guess in a session is only a hint');
+  assert.match(second.systemMessage, /hard-won fix/);
+});
+
+test('workflows: the same procedure in a third session is offered as a skill, once', () => {
+  const release = (sid) => {
+    hook('session-start', { session_id: sid, source: 'startup' });
+    for (const c of ['npm version patch', 'git push --follow-tags', 'npm publish', 'gh release create v1 --notes x']) ok(c, sid);
+    hook('tool-ok', { session_id: sid, tool_name: 'mcp__slack__slack_read_channel', tool_input: {} });
+    hook('tool-ok', { session_id: sid, tool_name: 'mcp__slack__send_message', tool_input: {} });
+    return hook('stop', { session_id: sid });
+  };
+  assert.equal(release('a'), null);
+  assert.equal(release('b'), null);
+  const out = release('c');
+  assert.equal(out.decision, 'block');
+  assert.match(out.reason, /procedure now done in 3 sessions: `npm version`, `npm publish`, `gh release create`, `mcp:slack\/send_message`/);
+  assert.ok(!/read_channel|git push/.test(out.reason), 'reads and plumbing are not steps');
+  assert.equal(release('d'), null, 'asked once; quiet for a while');
+  assert.equal(ledger().filter((e) => e.ev === 'procedure').length, 4);
+});
+
+test('workflows: a turn where a skill fired is already covered', () => {
+  writeSkill(box.userSkills, 'release');
+  for (const sid of ['a', 'b', 'c']) {
+    if (sid === 'c') useSkill('release', sid);
+    for (const c of ['npm version patch', 'npm publish', 'gh release create v1']) ok(c, sid);
+    assert.equal(hook('stop', { session_id: sid }), null);
+  }
+});
+
+test('CLI finds the session\'s project even from a subdirectory without CLAUDE_PROJECT_DIR', () => {
+  writeSkill(box.projectSkills, 'local-skill');
+  hook('session-start', { session_id: 'sess-1', source: 'startup' });
+  const env = { ...process.env };
+  delete env.CLAUDE_PROJECT_DIR;
+  const sub = join(box.env.CLAUDE_PROJECT_DIR, 'packages', 'api');
+  mkdirSync(sub, { recursive: true });
+  const run = (...args) => spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf8', env, cwd: sub });
+  const res = run('--session', 'sess-1', 'register', join(box.projectSkills, 'local-skill'));
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /registered local-skill v1 \(project\)/);
+  const unsubstituted = run('--session', '${CLAUDE_SESSION_ID}', 'list', '--json');
+  assert.equal(unsubstituted.status, 0, 'a literal placeholder is ignored, not fatal');
+
+  mkdirSync(join(box.env.CLAUDE_PROJECT_DIR, '.git'));
+  const viaGit = JSON.parse(run('list', '--json').stdout);
+  assert.equal(viaGit[0]?.name, 'local-skill', 'without --session the git root is found');
 });
