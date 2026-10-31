@@ -8,13 +8,14 @@ disable-model-invocation: true
 
 Every skill's description is loaded into every session, and skills with overlapping triggers compete with each other. Pruning protects the context budget; it is not just tidying.
 
-Below, `evolution <cmd>` means `node "${CLAUDE_PLUGIN_ROOT}/scripts/evolution.mjs" <cmd>`.
+Below, `evolution <cmd>` means `node "${CLAUDE_PLUGIN_ROOT}/scripts/evolution.mjs" --session "${CLAUDE_SESSION_ID}" <cmd>`.
 
 ## 1. Gather
 
 Run `evolution candidates`, then `evolution list`. Candidates come from simple rules:
 
 - `retire?`: idle for N days *and* M sessions, so infrequent users aren't punished.
+- `refine?`: the session struggled right after most recent uses of this version, so the skill fires but misleads.
 - `trim?`: a long description or a bloated body.
 - `merge?`: descriptions that overlap.
 
@@ -28,6 +29,7 @@ Read the candidate's `SKILL.md` and `CHANGELOG.md`, then pick a verdict:
 |---|---|---|
 | retire | The lesson is obsolete (the dependency is gone, the bug was fixed upstream, the code moved on), or the skill never fires and its trigger can't be fixed | `evolution retire <skill> --reason "..."` |
 | fix trigger | The lesson is still valid but the skill rarely fires, because the description doesn't match how the problem shows up | Rewrite the description, then `evolution register <dir> --note "..."` |
+| refine | The skill fires, but the session keeps struggling afterwards (high TROUBLE in `evolution list`) | Find what it gets wrong (its `CHANGELOG.md` and the user can help), correct the body, then register |
 | merge | Two skills cover the same ground | Fold the weaker skill into the stronger one, register the survivor, retire the other |
 | trim | The description is long or the body is bloated | Shorten it, move reference material into a supporting file in the skill directory, then register |
 | keep | The skill is quiet but valuable: rare and high-stakes, like disaster recovery or release steps | `evolution keep <skill> --reason "..."` resets its idle clock |

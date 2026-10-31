@@ -2,8 +2,8 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "evolution",
   "displayName": "Evolution",
-  "version": "0.1.0",
-  "description": "Self-evolving skills: notices hard-won fixes, turns each into a new or updated versioned skill, tracks which skills actually fire, and prunes the ones that stop earning their keep.",
+  "version": "0.2.0",
+  "description": "Self-evolving skills: turns hard-won fixes and repeated workflows into versioned skills, refines a skill when the session struggles right after it fires, and prunes the ones that stop earning their keep.",
   "author": {
     "name": "Fingerskier",
     "url": "https://fingerskier.github.io"
@@ -16,7 +16,7 @@
     "nudge": {
       "type": "string",
       "title": "Nudge mode",
-      "description": "What happens when a session looks like a hard-won fix. auto: Claude is asked to evaluate it with evolution:capture before stopping. suggest: you get a one-line hint and decide. off: only explicit /evolution:capture.",
+      "description": "What happens when a skill misfired, a fix was hard-won, or a workflow repeats. auto: Claude is asked to act with evolution:capture before stopping (always for misfired skills, at most once per session for other guesses). suggest: you get a one-line hint and decide. off: only explicit /evolution:capture.",
       "default": "auto"
     },
     "struggle_threshold": {

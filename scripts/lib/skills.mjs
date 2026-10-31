@@ -1,13 +1,20 @@
 // Finding, versioning, retiring and restoring skills. Evolved skills are plain
 // Claude Code skills in the user or project skills directory; what makes them
 // "evolved" is the `evolution-version` key in their frontmatter metadata.
+//
+// Every skill has an owner, which decides what Claude may do to it:
+//   evolved  stamped by register: Claude refines it directly.
+//   hand     written by a person: Claude proposes a change and asks first.
+//   locked   `metadata: evolution: "off"`: never nudged about, never registered.
 import {
   cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { contentHash, joinFrontmatter, parseFrontmatter, setOwnMetadata, splitFrontmatter } from './frontmatter.mjs';
-import { archiveDir, historyDir, projectDir, projectSkillsRoot, skillSlug, userSkillsRoot } from './paths.mjs';
+import {
+  archiveDir, historyDir, legacySlug, projectDir, projectIdentity, projectSkillsRoot, skillKey, skillSlug, userSkillsRoot,
+} from './paths.mjs';
 import { logEvent, readJson, writeJson } from './store.mjs';
 
 const today = (now = Date.now()) => new Date(now).toISOString().slice(0, 10);
@@ -23,6 +30,8 @@ const within = (child, parent) => {
   const rel = relative(parent, child);
   return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel) && !rel.includes(sep);
 };
+
+const LOCKED = /^(?:off|false|no|locked|never)$/i;
 
 export function readSkill(dir, root) {
   const file = join(dir, 'SKILL.md');
@@ -41,13 +50,18 @@ export function readSkill(dir, root) {
     data,
     description: data.description ?? '',
     evolved: meta['evolution-version'] !== undefined,
+    locked: LOCKED.test(String(meta.evolution ?? '')),
     version: Number.parseInt(meta['evolution-version'], 10) || 0,
     created: meta['evolution-created'] ?? null,
     updated: meta['evolution-updated'] ?? null,
     hash: meta['evolution-hash'] ?? null,
     bodyLines: parts.body.split(/\r?\n/).length,
   };
+  skill.owner = skill.locked ? 'locked' : skill.evolved ? 'evolved' : 'hand';
   skill.slug = skillSlug(skill);
+  skill.legacySlug = legacySlug(skill);
+  skill.key = skillKey(skill);
+  skill.projectId = skill.project ? projectIdentity(skill.project) : null;
   return skill;
 }
 
@@ -77,7 +91,13 @@ export function resolveSkill(ref, { scope, project } = {}) {
     let dir = resolve(ref.replace(/^~(?=[\\/])/, homedir()));
     if (basename(dir) === 'SKILL.md') dir = dirname(dir);
     if (!existsSync(join(dir, 'SKILL.md'))) throw new Error(`no SKILL.md in ${dir}`);
-    const root = rs.find((r) => within(dir, r.dir));
+    // A path of the form <project>/.claude/skills/<name> names its own project,
+    // whatever the cwd is.
+    const parent = dirname(dir);
+    const own = basename(parent) === 'skills' && basename(dirname(parent)) === '.claude'
+      ? { scope: 'project', dir: parent, project: dirname(dirname(parent)) }
+      : null;
+    const root = rs.find((r) => within(dir, r.dir)) ?? own;
     if (!root) {
       throw new Error(`${dir} is not directly inside a skills directory Claude Code loads:\n  ${rs.map((r) => r.dir).join('\n  ')}`);
     }
@@ -92,24 +112,30 @@ export function resolveSkill(ref, { scope, project } = {}) {
   return hits[0];
 }
 
-// Like resolveSkill, but quiet: used by hooks to map an invoked name to a dir.
-export function findSkillDir(name, project) {
+// Like resolveSkill, but quiet: used by hooks to map an invoked name to a skill.
+export function findSkill(name, project) {
   // Claude Code gives personal skills precedence over project skills.
   for (const r of roots(project)) {
     const dir = join(r.dir, name);
-    if (existsSync(join(dir, 'SKILL.md'))) return { dir, scope: r.scope };
+    if (!existsSync(join(dir, 'SKILL.md'))) continue;
+    try { return readSkill(dir, r); } catch { return null; }
   }
   return null;
 }
 
-function snapshots(slug) {
-  const dir = historyDir(slug);
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir)
-    .map((f) => /^v(\d+)\.md$/.exec(f))
-    .filter(Boolean)
-    .map((m) => ({ version: Number(m[1]), file: join(dir, m[0]) }))
-    .sort((a, b) => a.version - b.version);
+// Snapshots under the current slug, plus any left under the v0.1 path-based
+// slug (same version number: the current slug wins).
+function snapshots(skill) {
+  const byVersion = new Map();
+  for (const slug of new Set([skill.legacySlug, skill.slug].filter(Boolean))) {
+    const dir = historyDir(slug);
+    if (!existsSync(dir)) continue;
+    for (const f of readdirSync(dir)) {
+      const m = /^v(\d+)\.md$/.exec(f);
+      if (m) byVersion.set(Number(m[1]), { version: Number(m[1]), file: join(dir, f) });
+    }
+  }
+  return [...byVersion.values()].sort((a, b) => a.version - b.version);
 }
 
 function addChangelog(skill, version, note, now) {
@@ -125,6 +151,9 @@ function addChangelog(skill, version, note, now) {
 // Stamp version metadata, snapshot, and changelog -- but only when the skill
 // actually changed since it was last stamped (or when forced, e.g. rollback).
 export function register(skill, { note, force = false, now = Date.now() } = {}) {
+  if (skill.locked) {
+    throw new Error(`${skill.name} is locked (metadata evolution: "${skill.data.metadata.evolution}"); remove that line to let evolution manage it`);
+  }
   if (!skill.parts.fm.length) throw new Error(`${skill.file} has no YAML frontmatter`);
   if (!skill.description.trim()) throw new Error(`${skill.file} has no description; Claude cannot trigger it without one`);
   const warnings = [];
@@ -141,7 +170,7 @@ export function register(skill, { note, force = false, now = Date.now() } = {}) 
   if (!force && skill.evolved && hash === skill.hash) {
     return { changed: false, version: skill.version, skill, warnings };
   }
-  const prior = snapshots(skill.slug).at(-1)?.version ?? 0;
+  const prior = snapshots(skill).at(-1)?.version ?? 0;
   const version = Math.max(skill.version, prior) + 1;
   const fm = setOwnMetadata(skill.parts.fm, {
     'evolution-version': version,
@@ -155,20 +184,20 @@ export function register(skill, { note, force = false, now = Date.now() } = {}) 
   writeFileSync(join(historyDir(skill.slug), `v${version}.md`), text);
   const why = note?.trim() || (skill.evolved ? 'Updated.' : 'Adopted by evolution.');
   addChangelog(skill, version, why, now);
-  logEvent({ ev: 'register', key: skill.dir, slug: skill.slug, name: skill.name, scope: skill.scope, version, note: why });
+  logEvent({ ev: 'register', key: skill.key, dir: skill.dir, slug: skill.slug, name: skill.name, scope: skill.scope, version, note: why });
   return { changed: true, version, previous: skill.version, skill, warnings };
 }
 
 export function history(skill) {
   const log = join(skill.dir, 'CHANGELOG.md');
   return {
-    snapshots: snapshots(skill.slug),
+    snapshots: snapshots(skill),
     changelog: existsSync(log) ? readFileSync(log, 'utf8') : '',
   };
 }
 
 export function rollback(skill, to, { note, now } = {}) {
-  const snap = snapshots(skill.slug).find((s) => s.version === Number(to));
+  const snap = snapshots(skill).find((s) => s.version === Number(to));
   if (!snap) throw new Error(`no snapshot v${to} for ${skill.name}; see \`history ${skill.name}\``);
   writeFileSync(skill.file, readFileSync(snap.file, 'utf8'));
   const restored = readSkill(skill.dir, { scope: skill.scope, project: skill.project });
@@ -190,7 +219,7 @@ export function retire(skill, { reason, now = Date.now() } = {}) {
     name: skill.name, scope: skill.scope, project: skill.project, from: skill.dir,
     version: skill.version, retiredAt: new Date(now).toISOString(), reason: reason ?? null,
   });
-  logEvent({ ev: 'retire', key: skill.dir, slug: skill.slug, name: skill.name, version: skill.version, reason: reason ?? null });
+  logEvent({ ev: 'retire', key: skill.key, dir: skill.dir, slug: skill.slug, name: skill.name, version: skill.version, reason: reason ?? null });
   return { archived: dest, slug: skill.slug };
 }
 
@@ -223,14 +252,14 @@ export function restore(ref) {
     rmSync(latest.path, { recursive: true, force: true });
   }
   rmSync(join(latest.from, '.evolution-archive.json'), { force: true });
-  logEvent({ ev: 'restore', key: latest.from, slug: latest.slug, name: latest.name });
+  logEvent({ ev: 'restore', dir: latest.from, slug: latest.slug, name: latest.name });
   return latest;
 }
 
 // "Low hits, high value" is real (the once-a-year disaster recipe). Keeping a
 // skill on purpose resets its idle clock so prune stops nagging about it.
 export function keep(skill, { reason } = {}) {
-  logEvent({ ev: 'keep', key: skill.dir, slug: skill.slug, name: skill.name, reason: reason ?? null });
+  logEvent({ ev: 'keep', key: skill.key, dir: skill.dir, slug: skill.slug, name: skill.name, reason: reason ?? null });
 }
 
 export function createdAt(skill) {
